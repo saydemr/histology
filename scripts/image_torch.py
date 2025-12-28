@@ -10,6 +10,7 @@ import kornia as K
 from kornia.enhance import equalize_clahe
 import einops as eo
 import ptwt
+import tqdm.auto as tqdm
 
 """
 Virtual H&E Staining Pipeline (GPU Accelerated)
@@ -22,7 +23,7 @@ The implementation utilizes PyTorch for FFT, matrix operations, and color handli
 
 # Check for GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Running on: {device}")
+# print(f"Running on: {device}")
 
 # Defining the Color Vectors (Ruifrok and Johnston)
 # Absorption values for [Red, Green, Blue]
@@ -111,14 +112,10 @@ def fft_damp(img_tensor: torch.Tensor, sigma=10):
     return res
 
 
-def destripe_channel(image, wavelet='db10', level=None, sigma=10):
+def destripe_channel(image, wavelet='db10', level=None, sigma=10) -> torch.Tensor:
     """
     Removes directional stripe artifacts.
     """
-    # if level is None:
-    #     level = pywt.dwt_max_level(min(image.shape), pywt.Wavelet(wavelet))
-        # level = min(level, 5)
-
     coeffs_list = ptwt.wavedec2(image, wavelet, mode="symmetric", level=level)
 
 
@@ -151,30 +148,29 @@ def preprocess_channel(image: torch.Tensor, is_nuclear=True):
     
     # 2. Background Subtraction (CPU - skimage/scipy)
     # Keeping this on CPU as standard PyTorch lacks 'rolling_ball' equivalent
-    background = restoration.rolling_ball(img, radius=50)
-    img = img - background
-    img = torch.maximum(img, 0)
-    print("Background subtraction completed.")
+    # img = img.to("cpu").numpy()
+    # background = restoration.rolling_ball(img, radius=50)
+    # img = img - background
+    # img = np.maximum(img, 0)
+    # print("Background subtraction completed.")
 
-    img = rolling_ball_pytorch(img, radius=50)
+    img = rolling_ball_pytorch(img, radius=10).squeeze()
 
     # 3. CLAHE (CPU - skimage)
-    # Keeping this on CPU as standard PyTorch lacks adaptive histogram equalization
-    img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
-    img_clahe = exposure.equalize_adapthist(img_norm, clip_limit=0.01, kernel_size=(64, 64))
-    t_img = torch.from_numpy(img_clahe).to(device, dtype=torch.float32)
+    # img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    # img_clahe = exposure.equalize_adapthist(img_norm, clip_limit=0.01, kernel_size=(64, 64))
+    # t_img = torch.from_numpy(img_clahe).to(device, dtype=torch.float32)
 
 
     # 3. CLAHE (CPU - opencv)
-    # Keeping this on CPU as standard PyTorch lacks adaptive histogram equalization
     # img_uint8 = (img_norm.numpy() * 255).astype(np.uint8)
     # clahe = cv2.createCLAHE(clipLimit=0.01 * 255, tileGridSize=(512,512))
     # img_clahe = clahe.apply(img_uint8)
     # t_img = torch.from_numpy(img_clahe).to(device, dtype=torch.float32)
 
     # 3. CLAHE (GPU - kornia)
-    # kornia_clahe = equalize_clahe(img.unsqueeze(0).unsqueeze(0), clip_limit=0.01, tile_grid_size=(512,512))
-    # img_clahe = kornia_clahe.squeeze().cpu().numpy()
+    kornia_clahe = equalize_clahe(eo.rearrange(img, "h w -> 1 1 h w"), clip_limit=0.01, grid_size=(256,256))
+    t_img = kornia_clahe.squeeze().to(device, dtype=torch.float32) * 255.0
 
     # 4. Handling "Eusion" Noise Floor (GPU)
     if not is_nuclear:
@@ -205,9 +201,7 @@ def preprocess_channel(image: torch.Tensor, is_nuclear=True):
 def beer_lambert_mapping(nuc_img: torch.Tensor, cyto_img: torch.Tensor):
     """
     Color Mapping Algorithm via Beer-Lambert Law (Fully GPU)
-    """
-    H, W = nuc_img.shape
-    
+    """    
     # 1. Calculate Optical Density (OD)
     # Stack along last dim to mimic (H, W, 3)
     # OD_c = (N * k_H * V_H_c) + (C * k_E * V_E_c)
@@ -265,24 +259,24 @@ def post_process(image_tensor):
     return final_img
 
 def process_image_pair(to_pro_3_path: str, eusion_path: str, output_path=None):
-    print(f"Loading images...\nNuclear: {to_pro_3_path}\nCytoplasmic: {eusion_path}")
+    # print(f"Loading images...\nNuclear: {to_pro_3_path}\nCytoplasmic: {eusion_path}")
     
-    nuc_raw = torch.from_numpy(cv2.imread(to_pro_3_path, cv2.IMREAD_GRAYSCALE)).float().cuda()
-    cyto_raw = torch.from_numpy(cv2.imread(eusion_path, cv2.IMREAD_GRAYSCALE)).float().cuda()
+    nuc_raw = torch.from_numpy(cv2.imread(to_pro_3_path, cv2.IMREAD_GRAYSCALE)).float().cuda() / 255.0
+    cyto_raw = torch.from_numpy(cv2.imread(eusion_path, cv2.IMREAD_GRAYSCALE)).float().cuda() / 255.0
 
-    print("Preprocessing Nuclear Channel (TO-PRO-3)...")
+    # print("Preprocessing Nuclear Channel (TO-PRO-3)...")
     # Returns GPU Tensor
     nuc_processed = preprocess_channel(nuc_raw, is_nuclear=True)
     
-    print("Preprocessing Cytoplasmic Channel (Eusion)...")
+    # print("Preprocessing Cytoplasmic Channel (Eusion)...")
     # Returns GPU Tensor
     cyto_processed = preprocess_channel(cyto_raw, is_nuclear=False)
     
-    print("Applying Beer-Lambert Color Mapping...")
+    # print("Applying Beer-Lambert Color Mapping...")
     # Returns GPU Tensor
     virtual_he = beer_lambert_mapping(nuc_processed, cyto_processed)
 
-    print("Post-processing...")
+    # print("Post-processing...")
     # Returns GPU Tensor
     final_he = post_process(virtual_he)
 
@@ -294,7 +288,7 @@ def process_image_pair(to_pro_3_path: str, eusion_path: str, output_path=None):
     
     if output_path:
         cv2.imwrite(output_path, final_bgr)
-        print(f"Saved Virtual H&E to {output_path}")
+        # print(f"Saved Virtual H&E to {output_path}")
         
     return final_he_cpu
 
@@ -305,17 +299,12 @@ output_dir = Path("./data/gpu_accelerated/")
 
 output_dir.mkdir(parents=True, exist_ok=True)
 
-
-try:
-    for nuc_path in nuc_image_dir.glob("*.tif"):
-        cyto_path = cyto_image_dir / nuc_path.name
-        output_path = output_dir / nuc_path.name
-        
-        if not cyto_path.exists():
-            print(f"Skipping {nuc_path.name}: Corresponding cytoplasmic image not found.")
-            continue
-        
-        result = process_image_pair(str(nuc_path), str(cyto_path), str(output_path))
+for nuc_path in tqdm.tqdm(nuc_image_dir.glob("*.tif"), desc="Processing Images"):
+    cyto_path = cyto_image_dir / nuc_path.name
+    output_path = output_dir / nuc_path.name
     
-except Exception as e:
-    print(f"Error: {e}")
+    if not cyto_path.exists():
+        # print(f"Skipping {nuc_path.name}: Corresponding cytoplasmic image not found.")
+        continue
+    
+    result = process_image_pair(str(nuc_path), str(cyto_path), str(output_path))
