@@ -8,6 +8,7 @@ import torch
 import torchvision.transforms.functional as TF
 import kornia as K
 from kornia.enhance import equalize_clahe
+import einops as eo
 import ptwt
 
 """
@@ -32,12 +33,59 @@ V_E = torch.tensor([0.093, 0.954, 0.283], device=device, dtype=torch.float32)
 k_H = 1.0
 k_E = 1.0
 
-def fft_damp(img_tensor, sigma=10):
+def rolling_ball_pytorch(img_tensor: torch.Tensor, radius=10):
+    """
+    Applies rolling ball background subtraction using Kornia.
+    
+    Args:
+        img_tensor (torch.Tensor): Input image [B, C, H, W], normalized 0-1.
+        radius (int): Radius of the rolling ball.
+        
+    Returns:
+        torch.Tensor: The background-subtracted image (Top-Hat transform).
+    """
+    # 1. Create the non-flat "Ball" kernel (structuring element)
+    # The kernel represents the height of the ball at each pixel.
+    device = img_tensor.device
+    dtype = img_tensor.dtype
+
+    if img_tensor.max() <= 1.0:
+        height_scale = 1.0 / 255.0
+    else:
+        height_scale = 1.0
+    
+    kernel_size = 2 * radius + 1
+    X, Y = torch.meshgrid(torch.linspace(-radius, radius, kernel_size, device=device),
+                          torch.linspace(-radius, radius, kernel_size, device=device), indexing='ij')
+
+    # Calculate height of the ball: z = sqrt(r^2 - x^2 - y^2)
+    # Pixels outside the ball radius should be -infinity (masked out)
+    dist_squared = X**2 + Y**2
+    valid_mask = dist_squared <= radius**2
+    
+    # Initialize kernel with -inf (for erosion) or similar logic. 
+    # For a ball, the values are the height offsets.
+    ball_height = torch.sqrt(torch.clamp(radius**2 - dist_squared, min=0))
+    scaled_ball_height = ball_height * height_scale
+    
+    # Mask out values outside the circle to avoid square artifacts
+    kernel = torch.where(valid_mask, scaled_ball_height, torch.tensor(-float('inf'), device=device, dtype=dtype))
+
+    # 2. Apply Top Hat Transform
+    # TopHat(I) = Image - Opening(Image)
+    # Opening(I) = Dilation(Erosion(I))
+    
+    # Kornia's top_hat performs this automatically
+    result = K.morphology.top_hat(eo.rearrange(img_tensor.float(), 'h w -> 1 1 h w'), kernel=kernel, engine='unfold')
+    
+    return result
+
+
+def fft_damp(img_tensor: torch.Tensor, sigma=10):
     """
     Applies FFT damping using PyTorch on GPU.
-    Input/Output are numpy arrays to interface with pywt/ptwt.
+    Input/Output are torch.Tensors on the GPU.
     """
-    # Move to GPU
     rows, cols = img_tensor.shape
     
     # Transform to Fourier Domain
@@ -60,57 +108,7 @@ def fft_damp(img_tensor, sigma=10):
     # Inverse FFT
     res = torch.real(torch.fft.ifft2(torch.fft.ifftshift(f_filtered)))
     
-    # Return to CPU/Numpy for pywt reconstruction
     return res
-
-
-def rolling_ball_pytorch(img_tensor, radius=50):
-    """
-    Applies rolling ball background subtraction using Kornia.
-    
-    Args:
-        img_tensor (torch.Tensor): Input image [B, C, H, W], normalized 0-1.
-        radius (int): Radius of the rolling ball.
-        
-    Returns:
-        torch.Tensor: The background-subtracted image (Top-Hat transform).
-    """
-    # 1. Create the non-flat "Ball" kernel (structuring element)
-    # The kernel represents the height of the ball at each pixel.
-    kernel_size = 2 * radius + 1
-    X, Y = np.meshgrid(np.linspace(-radius, radius, kernel_size),
-                       np.linspace(-radius, radius, kernel_size))
-    
-    # Calculate height of the ball: z = sqrt(r^2 - x^2 - y^2)
-    # Pixels outside the ball radius should be -infinity (masked out)
-    dist_squared = X**2 + Y**2
-    valid_mask = dist_squared <= radius**2
-    
-    # Initialize kernel with -inf (for erosion) or similar logic. 
-    # Kornia expects the structuring element relative values.
-    # For a ball, the values are the height offsets.
-    ball_height = np.sqrt(np.maximum(0, radius**2 - dist_squared))
-    
-    # Normalize height to match image scale if necessary, usually kept relative.
-    # However, for standard "rolling ball", we often just need the shape.
-    # If strictly mimicking 2D flat rolling ball (ImageJ default), use a flat disk:
-    # kernel = torch.from_numpy(valid_mask.astype(np.float32)).to(img_tensor.device)
-    
-    # EXACT PARITY with skimage "ball" kernel (non-flat):
-    kernel = torch.from_numpy(ball_height).float().to(img_tensor.device)
-    
-    # Mask out values outside the circle to avoid square artifacts
-    kernel[~torch.from_numpy(valid_mask).to(img_tensor.device)] = -float('inf')
-
-    # 2. Apply Top Hat Transform
-    # TopHat(I) = Image - Opening(Image)
-    # Opening(I) = Dilation(Erosion(I))
-    
-    # Kornia's top_hat performs this automatically
-    # Note: 'engine="convolution"' is faster but 'unfold' is more stable for non-flat
-    result = K.morphology.top_hat(img_tensor, kernel=kernel, engine='unfold')
-    
-    return result
 
 
 def destripe_channel(image, wavelet='db10', level=None, sigma=10):
@@ -121,14 +119,11 @@ def destripe_channel(image, wavelet='db10', level=None, sigma=10):
     #     level = pywt.dwt_max_level(min(image.shape), pywt.Wavelet(wavelet))
         # level = min(level, 5)
 
-    # 1. Decomposition (CPU - pywt)
-    # coeffs = pywt.wavedec2(image, wavelet, level=level)
-    # print("Starting destriping using hybrid CPU-GPU approach...")
     coeffs_list = ptwt.wavedec2(image, wavelet, mode="symmetric", level=level)
-    # coeffs_list = list(coeffs)
-    
-    new_list = [coeffs_list[0]]
+
+
     # 2. Filtering Detail Coefficients (GPU - fft_damp)
+    new_list = [coeffs_list[0]]
     for i in range(1, len(coeffs_list)):
         (cH, cV, cD) = coeffs_list[i]
         
@@ -136,10 +131,8 @@ def destripe_channel(image, wavelet='db10', level=None, sigma=10):
         cV_filtered = fft_damp(cV, sigma)
         cH_filtered = fft_damp(cH, sigma)
         
-        print(f"Level {i}: cH and cV filtered.")
-        print(coeffs_list[i])
         new_list.append(ptwt.WaveletDetailTuple2d(cH_filtered, cV_filtered, cD))
-        print(f"Level {i} coefficients updated.")
+
 
     # 3. Reconstruction (CPU - pywt)
     destriped_image = ptwt.waverec2(new_list, wavelet)
@@ -148,11 +141,11 @@ def destripe_channel(image, wavelet='db10', level=None, sigma=10):
     destriped_image = torch.clip(destriped_image, 0, torch.max(image))
     return destriped_image
 
-def preprocess_channel(image, is_nuclear=True):
+def preprocess_channel(image: torch.Tensor, is_nuclear=True):
     """
-    Destriping (GPU), CLAHE (CPU), Normalization (GPU)
+    Destriping (GPU), CLAHE (CPU (opencv) / GPU (kornia)), Normalization (GPU)
     """
-    # 1. Destriping (Hybrid)
+    # 1. Destriping (GPU)
     if min(image.shape) > 64:
         img = destripe_channel(image)
     
@@ -163,17 +156,25 @@ def preprocess_channel(image, is_nuclear=True):
     img = torch.maximum(img, 0)
     print("Background subtraction completed.")
 
+    img = rolling_ball_pytorch(img, radius=50)
 
     # 3. CLAHE (CPU - skimage)
     # Keeping this on CPU as standard PyTorch lacks adaptive histogram equalization
     img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
     img_clahe = exposure.equalize_adapthist(img_norm, clip_limit=0.01, kernel_size=(64, 64))
+    t_img = torch.from_numpy(img_clahe).to(device, dtype=torch.float32)
+
+
+    # 3. CLAHE (CPU - opencv)
+    # Keeping this on CPU as standard PyTorch lacks adaptive histogram equalization
+    # img_uint8 = (img_norm.numpy() * 255).astype(np.uint8)
+    # clahe = cv2.createCLAHE(clipLimit=0.01 * 255, tileGridSize=(512,512))
+    # img_clahe = clahe.apply(img_uint8)
+    # t_img = torch.from_numpy(img_clahe).to(device, dtype=torch.float32)
 
     # 3. CLAHE (GPU - kornia)
-    # kornia_clahe = equalize_clahe(img.unsqueeze(0).unsqueeze(0), clip_limit=0.01, tile_grid_size=(8,8))
-    # img_clahe_kornia = kornia_clahe.squeeze().cpu().numpy()
-    
-    t_img = torch.from_numpy(img_clahe).to(device, dtype=torch.float32)
+    # kornia_clahe = equalize_clahe(img.unsqueeze(0).unsqueeze(0), clip_limit=0.01, tile_grid_size=(512,512))
+    # img_clahe = kornia_clahe.squeeze().cpu().numpy()
 
     # 4. Handling "Eusion" Noise Floor (GPU)
     if not is_nuclear:
@@ -201,10 +202,9 @@ def preprocess_channel(image, is_nuclear=True):
         
     return torch.clamp(img_final, 0, 1.0)
 
-def beer_lambert_mapping(nuc_img, cyto_img):
+def beer_lambert_mapping(nuc_img: torch.Tensor, cyto_img: torch.Tensor):
     """
     Color Mapping Algorithm via Beer-Lambert Law (Fully GPU)
-    Inputs are PyTorch tensors.
     """
     H, W = nuc_img.shape
     
@@ -213,8 +213,8 @@ def beer_lambert_mapping(nuc_img, cyto_img):
     # OD_c = (N * k_H * V_H_c) + (C * k_E * V_E_c)
     
     # Expand dims for broadcasting: (H, W, 1) * (3,)
-    nuc_expanded = nuc_img.unsqueeze(-1)
-    cyto_expanded = cyto_img.unsqueeze(-1)
+    nuc_expanded = eo.rearrange(nuc_img, "h w -> h w 1")
+    cyto_expanded = eo.rearrange(cyto_img, "h w -> h w 1")
     
     OD = (nuc_expanded * k_H * V_H) + (cyto_expanded * k_E * V_E)
         
@@ -222,7 +222,7 @@ def beer_lambert_mapping(nuc_img, cyto_img):
     # I = I0 * exp(-OD)
     transmission = 255.0 * torch.exp(-OD)
     
-    # Clip to valid range
+    # Clamp to valid range
     transmission = torch.clamp(transmission, 0, 255).to(torch.uint8)
     
     return transmission
@@ -235,7 +235,6 @@ def post_process(image_tensor):
     img_float = image_tensor.to(torch.float32)
     
     # 1. Warmth Adjustment
-    # R channel is index 0, B is index 2
     img_float[:, :, 0] *= 1.05 
     img_float[:, :, 2] *= 0.95 
     img_float = torch.clamp(img_float, 0, 255)
@@ -243,7 +242,8 @@ def post_process(image_tensor):
     # 2. Sharpening (Unsharp Mask)
     # Need (B, C, H, W) for grid-based ops or convolution
     # Permute to (C, H, W) and add batch dim
-    img_permuted = img_float.permute(2, 0, 1).unsqueeze(0) # (1, 3, H, W)
+    img_permuted = eo.rearrange(img_float, "h w c -> 1 c h w") # (1, 3, H, W)
+    # img_permuted = img_float.permute(2, 0, 1).unsqueeze(0) 
     
     # Normalize to 0-1 for processing
     img_norm = img_permuted / 255.0
@@ -259,15 +259,16 @@ def post_process(image_tensor):
     sharpened = torch.clamp(sharpened * 255.0, 0, 255)
     
     # Remove batch dim and permute back to (H, W, 3)
-    final_img = sharpened.squeeze(0).permute(1, 2, 0).to(torch.uint8)
+    final_img = eo.rearrange(sharpened, "1 c h w -> h w c").to(torch.uint8)
+    # final_img = sharpened.squeeze(0).permute(1, 2, 0).to(torch.uint8)
     
     return final_img
 
 def process_image_pair(to_pro_3_path: str, eusion_path: str, output_path=None):
     print(f"Loading images...\nNuclear: {to_pro_3_path}\nCytoplasmic: {eusion_path}")
     
-    nuc_raw = torch.from_numpy(cv2.imread(to_pro_3_path, cv2.IMREAD_GRAYSCALE)).double().cuda()
-    cyto_raw = torch.from_numpy(cv2.imread(eusion_path, cv2.IMREAD_GRAYSCALE)).double().cuda()
+    nuc_raw = torch.from_numpy(cv2.imread(to_pro_3_path, cv2.IMREAD_GRAYSCALE)).float().cuda()
+    cyto_raw = torch.from_numpy(cv2.imread(eusion_path, cv2.IMREAD_GRAYSCALE)).float().cuda()
 
     print("Preprocessing Nuclear Channel (TO-PRO-3)...")
     # Returns GPU Tensor
