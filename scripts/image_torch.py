@@ -21,6 +21,26 @@ It translates two-channel fluorescence images (TO-PRO-3 and Eusion) into a Virtu
 The implementation utilizes PyTorch for FFT, matrix operations, and color handling.
 """
 
+SAVE_PICS = True
+
+# Simple counter to track imsave call order across this script
+_imsave_counter = 0
+_imsave_slice_number = -1
+
+def tracked_imsave(fname, arr, **kwargs):
+    """Save an image using plt.imsave but prepend a call-order counter to the filename.
+
+    Example: calling tracked_imsave('foo.png', arr) when counter==1 will write '001_foo.png'.
+    """
+    global _imsave_counter
+    _imsave_counter += 1
+    p = Path(fname)
+    # zero-pad the counter for nicer sorting
+    numbered_name = f"{_imsave_counter:03d}_{_imsave_slice_number}_{p.name}"
+    target = p.with_name(numbered_name)
+    plt.imsave(str(target), arr, **kwargs)
+
+
 # Check for GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # print(f"Running on: {device}")
@@ -143,18 +163,28 @@ def preprocess_channel(image: torch.Tensor, is_nuclear=True):
     Destriping (GPU), CLAHE (CPU (opencv) / GPU (kornia)), Normalization (GPU)
     """
     # 1. Destriping (GPU)
+    device = image.device
+    dtype = image.dtype
+
     if min(image.shape) > 64:
-        img = destripe_channel(image)
+        img = destripe_channel(image, sigma=5)
     
+    if SAVE_PICS:
+        img_cpu = img.cpu().numpy()
+        tracked_imsave(f"destriped_{'nuc' if is_nuclear else 'cyto'}.png", img_cpu, cmap='gray')
     # 2. Background Subtraction (CPU - skimage/scipy)
     # Keeping this on CPU as standard PyTorch lacks 'rolling_ball' equivalent
     # img = img.to("cpu").numpy()
-    # background = restoration.rolling_ball(img, radius=50)
+    # background = restoration.rolling_ball(img, radius=10)
     # img = img - background
     # img = np.maximum(img, 0)
     # print("Background subtraction completed.")
 
     img = rolling_ball_pytorch(img, radius=10).squeeze()
+
+    if SAVE_PICS:
+        img_cpu = img.cpu().numpy()
+        tracked_imsave(f"bgsub_{'nuc' if is_nuclear else 'cyto'}.png", img_cpu, cmap='gray')
 
     # 3. CLAHE (CPU - skimage)
     # img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
@@ -172,6 +202,10 @@ def preprocess_channel(image: torch.Tensor, is_nuclear=True):
     kornia_clahe = equalize_clahe(eo.rearrange(img, "h w -> 1 1 h w"), clip_limit=0.01, grid_size=(256,256))
     t_img = kornia_clahe.squeeze().to(device, dtype=torch.float32) * 255.0
 
+    if SAVE_PICS:
+        img_cpu = t_img.cpu().numpy()
+        tracked_imsave(f"clahe_{'nuc' if is_nuclear else 'cyto'}.png", img_cpu, cmap='gray')
+
     # 4. Handling "Eusion" Noise Floor (GPU)
     if not is_nuclear:
         # Calculate 10th percentile, flatten for quantile
@@ -180,6 +214,10 @@ def preprocess_channel(image: torch.Tensor, is_nuclear=True):
         val, _ = torch.kthvalue(flat, k)
         noise_floor = val
         t_img = torch.maximum(t_img - noise_floor, torch.tensor(0.0, device=device))
+
+    if SAVE_PICS:
+        img_cpu = t_img.cpu().numpy()
+        tracked_imsave(f"postfloor_{'nuc' if is_nuclear else 'cyto'}.png", img_cpu, cmap='gray')
 
     # 5. Percentile Scaling / Normalization
     flat = t_img.view(-1)
@@ -232,6 +270,10 @@ def post_process(image_tensor):
     img_float[:, :, 0] *= 1.05 
     img_float[:, :, 2] *= 0.95 
     img_float = torch.clamp(img_float, 0, 255)
+
+    if SAVE_PICS:
+        img_cpu = img_float.cpu().numpy()
+        tracked_imsave("post_warmth.png", img_cpu.astype(np.uint8))
     
     # 2. Sharpening (Unsharp Mask)
     # Need (B, C, H, W) for grid-based ops or convolution
@@ -267,18 +309,32 @@ def process_image_pair(to_pro_3_path: str, eusion_path: str, output_path=None):
     # print("Preprocessing Nuclear Channel (TO-PRO-3)...")
     # Returns GPU Tensor
     nuc_processed = preprocess_channel(nuc_raw, is_nuclear=True)
+    if SAVE_PICS:
+        img_cpu = nuc_processed.cpu().numpy()
+        tracked_imsave("final_nuc.png", img_cpu, cmap='gray')
     
     # print("Preprocessing Cytoplasmic Channel (Eusion)...")
     # Returns GPU Tensor
     cyto_processed = preprocess_channel(cyto_raw, is_nuclear=False)
+    if SAVE_PICS:
+        img_cpu = cyto_processed.cpu().numpy()
+        tracked_imsave("final_cyto.png", img_cpu, cmap='gray')
     
     # print("Applying Beer-Lambert Color Mapping...")
     # Returns GPU Tensor
     virtual_he = beer_lambert_mapping(nuc_processed, cyto_processed)
 
+    if SAVE_PICS:
+        img_cpu = virtual_he.cpu().numpy()
+        tracked_imsave("virtual_he_before_post.png", img_cpu)
+
     # print("Post-processing...")
     # Returns GPU Tensor
     final_he = post_process(virtual_he)
+
+    if SAVE_PICS:
+        img_cpu = final_he.cpu().numpy()
+        tracked_imsave("final_virtual_he.png", img_cpu)
 
     # Move to CPU for saving
     final_he_cpu = final_he.cpu().numpy()
@@ -302,6 +358,9 @@ output_dir.mkdir(parents=True, exist_ok=True)
 for nuc_path in tqdm.tqdm(nuc_image_dir.glob("*.tif"), desc="Processing Images"):
     cyto_path = cyto_image_dir / nuc_path.name
     output_path = output_dir / nuc_path.name
+
+    _imsave_slice_number = cyto_path.__str__().split("/")[-1].split(".")[0].split("_")[-1]
+
     
     if not cyto_path.exists():
         # print(f"Skipping {nuc_path.name}: Corresponding cytoplasmic image not found.")
