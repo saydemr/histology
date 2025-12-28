@@ -250,6 +250,10 @@ def beer_lambert_mapping(nuc_img: torch.Tensor, cyto_img: torch.Tensor):
     
     OD = (nuc_expanded * k_H * V_H) + (cyto_expanded * k_E * V_E)
         
+    if SAVE_PICS:
+        OD_cpu = OD.cpu().numpy()
+        tracked_imsave("optical_density.png", OD_cpu / torch.max(OD).cpu().numpy())
+
     # 2. Calculate Transmission
     # I = I0 * exp(-OD)
     transmission = 255.0 * torch.exp(-OD)
