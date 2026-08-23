@@ -56,24 +56,22 @@ def _process_one(args) -> tuple[str, float, bool, str | None]:
     """Runs in a worker process. Returns (filename, elapsed_seconds, was_empty, error_or_None)."""
     c01_path, c02_path, name, out_dir, cfg, c1_range, c2_range = args
     t0 = time.time()
-    try:
-        rgb = run_pipeline(
-            str(c01_path),
-            str(c02_path),
-            cfg,
-            c1_global_range=c1_range,
-            c2_global_range=c2_range,
-        )
-        out_path = Path(out_dir) / (Path(name).stem + ".png")
-        skio.imsave(
-            str(out_path),
-            (np.clip(rgb, 0, 1) * 255).astype(np.uint8),
-            check_contrast=False,
-        )
-        was_empty = bool(rgb.std(axis=(0, 1)).max() < 0.01)
-        return (name, time.time() - t0, was_empty, None)
-    except Exception as e:  # noqa: BLE001 - want to keep going on a single bad slice
-        return (name, time.time() - t0, False, f"{type(e).__name__}: {e}")
+
+    rgb = run_pipeline(
+        str(c01_path),
+        str(c02_path),
+        cfg,
+        c1_global_range=c1_range,
+        c2_global_range=c2_range,
+    )
+    out_path = Path(out_dir) / (Path(name).stem + ".png")
+    skio.imsave(
+        str(out_path),
+        (np.clip(rgb, 0, 1) * 255).astype(np.uint8),
+        check_contrast=False,
+    )
+    was_empty = bool(rgb.std(axis=(0, 1)).max() < 0.01)
+    return (name, time.time() - t0, was_empty, None)
 
 
 def main():
@@ -104,11 +102,6 @@ def main():
         type=int,
         default=None,
         help="Only process the first N pairs (for a quick test).",
-    )
-    parser.add_argument(
-        "--no-auto-detect",
-        action="store_true",
-        help="Disable automatic nuclear/structural channel detection.",
     )
     parser.add_argument(
         "--no-denoise",
@@ -143,10 +136,7 @@ def main():
         print("[batch] No matching pairs found. Check --data-dir and --pattern.")
         return
 
-    cfg = VirtualHEConfig(
-        auto_detect_channel_roles=not args.no_auto_detect,
-        denoise=not args.no_denoise,
-    )
+    cfg = VirtualHEConfig(denoise=not args.no_denoise)
 
     c1_range = c2_range = None
     if not args.no_global_range:
@@ -155,8 +145,7 @@ def main():
         c2_paths = [str(c02) for _, c02, _ in pairs]
         print(
             f"[batch] Estimating whole-stack intensity range from {len(pairs)} pairs "
-            f"(stride={args.global_range_stride})... this keeps normalization consistent "
-            f"across slices and lets genuinely empty slices be recognized correctly. "
+            f"(stride={args.global_range_stride})..."
         )
         c1_range = estimate_global_range(
             c1_paths,

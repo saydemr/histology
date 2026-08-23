@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 import tifffile
 from scipy import ndimage as ndi
-from skimage import color, exposure, filters, img_as_float32, io, morphology
+from skimage import color, exposure, img_as_float32, io
 from skimage.restoration import denoise_nl_means, estimate_sigma
 
 
@@ -50,7 +50,7 @@ class VirtualHEConfig:
     saturation_k: float = 6.0  # sigmoid steepness for stain-saturation kinetics
 
     max_optical_density: float = 0.42  # peak per-stain optical density
-    hematoxylin_od_cap: float = 0.30  # nuclei: kept lower than max_optical_density so they read as saturated blue/purple rather than near-black
+    hematoxylin_od_cap: float = 0.18  # nuclei: kept lower than max_optical_density so they read as saturated blue/purple rather than near-black
 
     # postprocessing
     background_percentile: float = 99.0  # pixels above this treated as background
@@ -60,7 +60,6 @@ class VirtualHEConfig:
     unsharp_amount: float = 0.4
 
     #  misc
-    auto_detect_channel_roles: bool = True
     seed: int = 0
 
 
@@ -82,8 +81,7 @@ def load_channel(path: str) -> np.ndarray:
 # Preprocessing
 def subtract_background(img: np.ndarray, radius: int) -> np.ndarray:
     """Morphological white top-hat background subtraction (rolling-ball
-    approximation). Removes smooth out-of-focus glow / light-sheet haze
-    while preserving sharp nuclear/fiber structures.
+    approximation).
     """
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
@@ -129,8 +127,7 @@ def estimate_global_range(
 
 def _robust_sigma(img: np.ndarray) -> float:
     """Median-absolute-deviation based noise sigma estimate on the finest
-    wavelet-free high-frequency residual (img - gaussian-blur). Avoids a
-    hard dependency on PyWavelets while remaining robust to outliers."""
+    wavelet-free high-frequency residual (img - gaussian-blur)."""
     residual = img - ndi.gaussian_filter(img, sigma=1)
     mad = np.median(np.abs(residual - np.median(residual)))
     return float(mad / 0.6745)
@@ -160,9 +157,7 @@ def channel_has_signal(
     own_spread = float(np.percentile(raw, high_pct) - np.percentile(raw, low_pct))
     sigma = _robust_sigma(raw)
     if sigma <= 1e-6:
-        return (
-            own_spread > 1e-6
-        )  # perfectly flat noise-free frame is the only edge case here
+        return own_spread > 1e-6
     return own_spread >= snr_multiplier * sigma
 
 
@@ -195,39 +190,6 @@ def preprocess_channel(
     if cfg.denoise:
         img = denoise_channel(img, cfg.denoise_patch_size, cfg.denoise_patch_distance)
     return np.clip(img, 0, 1).astype(np.float32), False
-
-
-def _blob_score(img: np.ndarray) -> float:
-    """Higher score => image looks more like discrete round nuclear blobs.
-    Lower score => image looks like diffuse fibrous/continuous structural signal."""
-    thresh = filters.threshold_otsu(img) if img.max() > img.min() else 0.5
-    binary = img > thresh
-    binary = morphology.remove_small_objects(binary, max_size=3)
-    labeled, n_labels = ndi.label(binary)
-    if n_labels == 0:
-        return 0.0
-
-    sizes = ndi.sum(binary, labeled, range(1, n_labels + 1))
-    total_area = binary.size
-
-    mean_size = np.mean(sizes) if len(sizes) else 1.0
-    density = n_labels / total_area * 1e4
-
-    score = density / (mean_size**0.5 + 1e-3)
-    return float(score)
-
-
-def detect_nuclear_channel(
-    chan_a: np.ndarray, chan_b: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, bool]:
-    """Returns (nuclear_channel, structural_channel, swapped_flag).
-    swapped_flag=True means chan_a was actually the structural channel and
-    chan_b was the nuclear one"""
-    score_a = _blob_score(chan_a)
-    score_b = _blob_score(chan_b)
-    if score_b > score_a:
-        return chan_b, chan_a, True
-    return chan_a, chan_b, False
 
 
 # Virtual staining: forward Beer-Lambert H&E compositing
@@ -376,16 +338,7 @@ def run_pipeline(
         rgb = white_balance_background(rgb, c_h, c_e, cfg)
         return rgb.astype(np.float32)
 
-    if cfg.auto_detect_channel_roles:
-        nuclear, structural, swapped = detect_nuclear_channel(chan_a, chan_b)
-        if swapped:
-            print(
-                "[virtual_he] Auto-detection: input channel order looked "
-                "swapped relative to (C1=nuclear, C2=structural); "
-                "correcting automatically based on blob statistics."
-            )
-    else:
-        nuclear, structural = chan_a, chan_b
+    nuclear, structural = chan_a, chan_b
 
     c_h, c_e = channels_to_concentrations(nuclear, structural, cfg)
     rgb = beer_lambert_composite(c_h, c_e)
@@ -418,19 +371,11 @@ def main():
         help="Optional reference real H&E patch for color grading.",
     )
     parser.add_argument(
-        "--no-auto-detect",
-        action="store_true",
-        help="Disable automatic nuclear/structural channel detection.",
-    )
-    parser.add_argument(
         "--no-denoise", action="store_true", help="Disable NLM denoising step."
     )
     args = parser.parse_args()
 
-    cfg = VirtualHEConfig(
-        auto_detect_channel_roles=not args.no_auto_detect,
-        denoise=not args.no_denoise,
-    )
+    cfg = VirtualHEConfig(denoise=not args.no_denoise)
 
     rgb = run_pipeline(args.c1, args.c2, cfg, reference_he_path=args.reference_he)
 
